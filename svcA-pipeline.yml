@@ -1,0 +1,20 @@
+trigger: none
+
+parameters:
+- name: envs
+  displayName: "Resolved envs (leave as 'unresolved' — auto-filled)"
+  type: string
+  default: "unresolved"
+
+variables:
+  - group: dss_devops_variables
+
+extends:
+  template: templates/gitops-deploy-template.yml
+  parameters:
+    serviceName: "svcA"
+    envs: ${{ parameters.envs }}
+    matrixFile: "matrix.yaml"
+    repoOwner: "surendraaaaa"
+    repoName: "argocd"
+    baseBranch: "main"
