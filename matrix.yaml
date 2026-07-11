@@ -1,0 +1,25 @@
+# matrix.yaml - defines which envs each service can deploy to
+services:
+  svcA:
+    environments:
+      - dv1
+      - dv2
+      - dv3
+      - dv4
+      - dv5
+
+  svcB:
+    environments:
+      - dv3
+      - dv4
+      - dv5
+      - dv6
+      - dv7
+
+  svcC:
+    environments:
+      - dv6
+      - dv7
+      - dv8
+      - dv9
+      - dv10
