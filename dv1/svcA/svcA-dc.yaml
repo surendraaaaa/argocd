@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: svcA
-          image: registry.example.com/svcA:1.0.0-init
+          image: registry.example.com/svcA:300
           ports:
             - containerPort: 8080
           env:
