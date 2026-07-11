@@ -1,0 +1,36 @@
+apiVersion: apps.openshift.io/v1
+kind: DeploymentConfig
+metadata:
+  name: svcA
+  namespace: dv1
+  labels:
+    app: svcA
+    env: dv1
+spec:
+  replicas: 1
+  selector:
+    app: svcA
+  strategy:
+    type: Rolling
+  template:
+    metadata:
+      labels:
+        app: svcA
+    spec:
+      containers:
+        - name: svcA
+          image: registry.example.com/svcA:1.0.0-init
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: dv1
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+  triggers:
+    - type: ConfigChange
