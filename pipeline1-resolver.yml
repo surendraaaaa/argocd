@@ -1,1 +1,112 @@
+trigger: none
 
+parameters:
+- name: serviceName
+  displayName: "Service to deploy"
+  type: string
+  default: "svcA"
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- checkout: self
+  clean: true
+
+- task: PythonScript@0
+  name: ResolveEnvs
+  displayName: "Resolve envs from matrix.yaml"
+  inputs:
+    scriptSource: inline
+    script: |
+      import yaml, json
+
+      with open("matrix.yaml") as f:
+          matrix = yaml.safe_load(f)
+
+      service = "${{ parameters.serviceName }}"
+      envs = matrix["services"].get(service, {}).get("environments", [])
+
+      if not envs:
+          print(f"##vso[task.logissue type=error]No envs found for {service}")
+          raise SystemExit(1)
+
+      print(f"Resolved envs for {service}: {envs}")
+
+      envs_json = json.dumps(envs)
+      print(f"##vso[task.setvariable variable=resolvedEnvsJson]{envs_json}")
+
+- task: PythonScript@0
+  displayName: "Trigger Pipeline 2 with resolved envs"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    ENVS_JSON: $(resolvedEnvsJson)
+    ORG_URI: $(System.CollectionUri)
+    PROJECT: $(System.TeamProject)
+    SERVICE_NAME: ${{ parameters.serviceName }}
+  inputs:
+    scriptSource: inline
+    script: |
+      import json, os, urllib.request, urllib.error
+
+      envs = json.loads(os.environ["ENVS_JSON"])
+      envs_csv = ",".join(envs)   # e.g. "dv1,dv2,dv3,dv4,dv5"
+
+      service_name = os.environ["SERVICE_NAME"]
+      token = os.environ["SYSTEM_ACCESSTOKEN"]
+      org_uri = os.environ["ORG_URI"].rstrip("/")
+      project = os.environ["PROJECT"]
+
+      pipeline_id = 21
+
+      url = f"{org_uri}/{project}/_apis/pipelines/{pipeline_id}/runs?api-version=7.1"
+
+      body = {
+          "resources": {
+              "repositories": {
+                  "self": {
+                      "refName": "refs/heads/main"
+                  }
+              }
+          },
+          "templateParameters": {
+              "serviceName": service_name,
+              "envs": envs_csv
+          }
+      }
+
+      print(f"POST {url}")
+      print(json.dumps(body, indent=2))
+
+      data = json.dumps(body).encode()
+      req = urllib.request.Request(
+          url, data=data, method="POST",
+          headers={
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json"
+          }
+      )
+
+      try:
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              result = json.loads(resp.read())
+              print(f"[SUCCESS] Triggered run: {result.get('id')}")
+      except urllib.error.HTTPError as e:
+          print(f"##vso[task.logissue type=error]HTTP {e.code}: {e.read().decode()}")
+          raise SystemExit(1)
+
+- task: PythonScript@0
+  displayName: "Print link to Pipeline 2"
+  env:
+    ORG_URI: $(System.CollectionUri)
+    PROJECT: $(System.TeamProject)
+  inputs:
+    scriptSource: inline
+    script: |
+      import os
+      org_uri = os.environ["ORG_URI"].rstrip("/")
+      project = os.environ["PROJECT"]
+      pipeline_id = 21
+      print(f"##[section]Deployment triggered.")
+      print(f"Go to Pipeline 2 to approve/deploy envs:")
+      print(f"{org_uri}/{project}/_build?definitionId={pipeline_id}")
