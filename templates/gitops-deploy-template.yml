@@ -1,0 +1,306 @@
+parameters:
+- name: serviceName
+  type: string
+
+- name: envs
+  type: string
+  default: "unresolved"
+
+- name: matrixFile
+  type: string
+  default: "matrix.yaml"
+
+- name: repoOwner
+  type: string
+
+- name: repoName
+  type: string
+
+- name: baseBranch
+  type: string
+  default: "main"
+
+stages:
+
+# =============================================================================
+- stage: Resolve
+  displayName: "Resolve Environments From Matrix"
+  condition: eq('${{ parameters.envs }}', 'unresolved')
+  jobs:
+  - job: resolve
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      clean: true
+
+    - task: PythonScript@0
+      name: ResolveEnvs
+      displayName: "Resolve envs from matrix file"
+      inputs:
+        scriptSource: inline
+        script: |
+          import yaml, json
+
+          with open("${{ parameters.matrixFile }}") as f:
+              matrix = yaml.safe_load(f)
+
+          service = "${{ parameters.serviceName }}"
+          envs = matrix["services"].get(service, {}).get("environments", [])
+
+          if not envs:
+              print(f"##vso[task.logissue type=error]No envs found for {service}")
+              raise SystemExit(1)
+
+          print(f"Resolved envs for {service}: {envs}")
+          envs_json = json.dumps(envs)
+          print(f"##vso[task.setvariable variable=resolvedEnvsJson]{envs_json}")
+
+    - task: PythonScript@0
+      displayName: "Re-trigger this pipeline with resolved envs"
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ENVS_JSON: $(resolvedEnvsJson)
+        ORG_URI: $(System.CollectionUri)
+        PROJECT: $(System.TeamProject)
+        SERVICE_NAME: ${{ parameters.serviceName }}
+        SELF_PIPELINE_ID: $(System.DefinitionId)
+      inputs:
+        scriptSource: inline
+        script: |
+          import json, os, urllib.request, urllib.error
+
+          envs = json.loads(os.environ["ENVS_JSON"])
+          envs_csv = ",".join(envs)
+
+          service_name = os.environ["SERVICE_NAME"]
+          token = os.environ["SYSTEM_ACCESSTOKEN"]
+          org_uri = os.environ["ORG_URI"].rstrip("/")
+          project = os.environ["PROJECT"]
+          pipeline_id = os.environ["SELF_PIPELINE_ID"]
+
+          url = f"{org_uri}/{project}/_apis/pipelines/{pipeline_id}/runs?api-version=7.1"
+
+          body = {
+              "resources": {"repositories": {"self": {"refName": "refs/heads/main"}}},
+              "templateParameters": {
+                  "serviceName": service_name,
+                  "envs": envs_csv
+              }
+          }
+
+          data = json.dumps(body).encode()
+          req = urllib.request.Request(
+              url, data=data, method="POST",
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  result = json.loads(resp.read())
+                  run_id = result.get("id")
+                  print(f"[SUCCESS] Triggered run: {run_id}")
+                  print(f"{org_uri}/{project}/_build/results?buildId={run_id}")
+          except urllib.error.HTTPError as e:
+              print(f"##vso[task.logissue type=error]HTTP {e.code}: {e.read().decode()}")
+              raise SystemExit(1)
+
+# =============================================================================
+- ${{ each env in split(parameters.envs, ',') }}:
+
+  - stage: Approve_${{ env }}
+    displayName: "Approve — ${{ env }}"
+    condition: ne('${{ parameters.envs }}', 'unresolved')
+    dependsOn: []
+    jobs:
+    - job: gate
+      pool: server
+      timeoutInMinutes: 4320
+      steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: 4320
+        inputs:
+          instructions: |
+            Service : ${{ parameters.serviceName }}
+            Env     : ${{ env }}
+            Click RESUME to deploy to ${{ env }}.
+          onTimeout: reject
+
+  - stage: Deploy_${{ env }}
+    displayName: "Deploy — ${{ env }}"
+    dependsOn: Approve_${{ env }}
+    jobs:
+    - job: deploy
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+      - checkout: none
+      - task: PythonScript@0
+        displayName: "Patch dc.yaml image tag and push branch"
+        env:
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
+          BUILD_BUILDID: $(Build.BuildId)
+        inputs:
+          scriptSource: inline
+          script: |
+            import os, re, subprocess, sys
+
+            REPO_OWNER = "${{ parameters.repoOwner }}"
+            REPO_NAME  = "${{ parameters.repoName }}"
+            SERVICE    = "${{ parameters.serviceName }}"
+            ENV_DIR    = "${{ env }}"
+            IMAGE_TAG  = os.environ.get("BUILD_BUILDID", "manual")
+            TOKEN      = os.environ["GITHUB_TOKEN"]
+            REPO_DIR   = f"/tmp/argocd-{ENV_DIR}-{IMAGE_TAG}"
+            BRANCH     = f"{SERVICE}-{ENV_DIR}-{IMAGE_TAG}"
+
+            def run(cmd, cwd=None):
+                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+                print(res.stdout); print(res.stderr)
+                if res.returncode != 0:
+                    sys.exit(res.returncode)
+
+            run(["git", "clone", f"https://x-access-token:{TOKEN}@github.com/{REPO_OWNER}/{REPO_NAME}.git", REPO_DIR])
+            run(["git", "config", "user.email", "devops@bmo.com"], cwd=REPO_DIR)
+            run(["git", "config", "user.name", "DevOps Automation"], cwd=REPO_DIR)
+            run(["git", "checkout", "-b", BRANCH], cwd=REPO_DIR)
+
+            dc_path = os.path.join(REPO_DIR, ENV_DIR, SERVICE, f"{SERVICE}-dc.yaml")
+            if not os.path.isfile(dc_path):
+                print(f"##vso[task.logissue type=error]{dc_path} not found.")
+                sys.exit(1)
+
+            with open(dc_path, encoding="utf-8") as f:
+                original = f.read()
+
+            pattern = rf"(image:\s+\S*{re.escape(SERVICE)}:)\S+"
+            updated, count = re.subn(pattern, rf"\g<1>{IMAGE_TAG}", original)
+            if count == 0:
+                print(f"##vso[task.logissue type=error]Tag pattern not matched.")
+                sys.exit(1)
+
+            with open(dc_path, "w", encoding="utf-8") as f:
+                f.write(updated)
+
+            run(["git", "add", dc_path], cwd=REPO_DIR)
+            run(["git", "commit", "-m", f"chore({SERVICE}): update {ENV_DIR} tag to {IMAGE_TAG}"], cwd=REPO_DIR)
+            run(["git", "push", "origin", BRANCH], cwd=REPO_DIR)
+            print(f"[SUCCESS] Branch '{BRANCH}' pushed.")
+
+  - stage: PR_${{ env }}
+    displayName: "Raise PR — ${{ env }}"
+    dependsOn: Deploy_${{ env }}
+    jobs:
+    - job: raisePR
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+      - task: PythonScript@0
+        displayName: "Create PR"
+        env:
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
+          BUILD_BUILDID: $(Build.BuildId)
+        inputs:
+          scriptSource: inline
+          script: |
+            import json, os, sys, urllib.request, urllib.error
+
+            REPO_OWNER  = "${{ parameters.repoOwner }}"
+            REPO_NAME   = "${{ parameters.repoName }}"
+            SERVICE     = "${{ parameters.serviceName }}"
+            ENV_DIR     = "${{ env }}"
+            IMAGE_TAG   = os.environ.get("BUILD_BUILDID", "manual")
+            HEAD_BRANCH = f"{SERVICE}-{ENV_DIR}-{IMAGE_TAG}"
+            BASE_BRANCH = "${{ parameters.baseBranch }}"
+            TOKEN       = os.environ["GITHUB_TOKEN"]
+            API_BASE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+
+            def gh(method, path, data=None):
+                headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"}
+                body = json.dumps(data).encode() if data else None
+                req = urllib.request.Request(f"{API_BASE}{path}", data=body, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    try: return e.code, json.loads(e.read())
+                    except: return e.code, {}
+
+            _, existing = gh("GET", f"/pulls?head={REPO_OWNER}:{HEAD_BRANCH}&base={BASE_BRANCH}&state=open")
+            if isinstance(existing, list) and existing:
+                pr_number = existing[0]["number"]
+                print(f"Existing PR #{pr_number} found.")
+            else:
+                status, resp = gh("POST", "/pulls", {
+                    "title": f"chore({SERVICE}): deploy {IMAGE_TAG} to {ENV_DIR}",
+                    "body": f"Automated GitOps PR for **{SERVICE}** -> **{ENV_DIR}** (tag: {IMAGE_TAG})",
+                    "head": HEAD_BRANCH, "base": BASE_BRANCH
+                })
+                pr_number = resp.get("number")
+                if not pr_number:
+                    print(f"##vso[task.logissue type=error]PR creation failed: {resp}")
+                    sys.exit(1)
+                print(f"[SUCCESS] PR #{pr_number}: {resp.get('html_url','')}")
+
+  - stage: MergeApprove_${{ env }}
+    displayName: "Approve Merge — ${{ env }}"
+    dependsOn: PR_${{ env }}
+    jobs:
+    - job: mergeGate
+      pool: server
+      timeoutInMinutes: 4320
+      steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: 4320
+        inputs:
+          instructions: |
+            Review the PR for ${{ parameters.serviceName }} — ${{ env }}.
+            Click RESUME to merge, REJECT to abort.
+          onTimeout: reject
+
+    - job: merge
+      dependsOn: mergeGate
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+      - task: PythonScript@0
+        displayName: "Merge PR via GitHub API"
+        env:
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
+          BUILD_BUILDID: $(Build.BuildId)
+        inputs:
+          scriptSource: inline
+          script: |
+            import json, os, sys, urllib.request, urllib.error
+
+            REPO_OWNER  = "${{ parameters.repoOwner }}"
+            REPO_NAME   = "${{ parameters.repoName }}"
+            SERVICE     = "${{ parameters.serviceName }}"
+            ENV_DIR     = "${{ env }}"
+            IMAGE_TAG   = os.environ.get("BUILD_BUILDID", "manual")
+            HEAD_BRANCH = f"{SERVICE}-{ENV_DIR}-{IMAGE_TAG}"
+            BASE_BRANCH = "${{ parameters.baseBranch }}"
+            TOKEN       = os.environ["GITHUB_TOKEN"]
+            API_BASE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+
+            def gh(method, path, data=None):
+                headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"}
+                body = json.dumps(data).encode() if data else None
+                req = urllib.request.Request(f"{API_BASE}{path}", data=body, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    try: return e.code, json.loads(e.read())
+                    except: return e.code, {}
+
+            _, prs = gh("GET", f"/pulls?head={REPO_OWNER}:{HEAD_BRANCH}&base={BASE_BRANCH}&state=open")
+            if not isinstance(prs, list) or not prs:
+                print("No open PR found — already merged?")
+                sys.exit(0)
+
+            pr_number = prs[0]["number"]
+            _, merge = gh("PUT", f"/pulls/{pr_number}/merge", {"merge_method": "squash"})
+            if not merge.get("merged"):
+                print(f"##vso[task.logissue type=error]Merge failed: {merge}")
+                sys.exit(1)
+            print(f"[SUCCESS] PR #{pr_number} merged for {ENV_DIR}")
