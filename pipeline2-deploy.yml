@@ -1,0 +1,86 @@
+trigger: none
+
+parameters:
+- name: serviceName
+  type: string
+  default: "svcA"
+
+- name: envs
+  type: object
+  default: []
+
+stages:
+- ${{ each env in parameters.envs }}:
+
+  # ── Stage 1: Approve before deploy ──────────────────────────
+  - stage: Approve_${{ env }}
+    displayName: "Approve — ${{ env }}"
+    jobs:
+    - job: gate
+      pool: server
+      timeoutInMinutes: 4320
+      steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: 4320
+        inputs:
+          instructions: |
+            Service : ${{ parameters.serviceName }}
+            Env     : ${{ env }}
+
+            Click RESUME to deploy to ${{ env }}.
+          onTimeout: reject
+
+  # ── Stage 2: Deploy ──────────────────────────────────────────
+  - stage: Deploy_${{ env }}
+    displayName: "Deploy — ${{ env }}"
+    dependsOn: Approve_${{ env }}
+    jobs:
+    - job: deploy
+      pool:
+        name: Main
+      steps:
+      - script: |
+          echo "Deploying ${{ parameters.serviceName }} to ${{ env }}"
+          # actual dc.yaml patch / kustomize update goes here
+        displayName: "Deploy to ${{ env }}"
+
+  # ── Stage 3: Raise PR ────────────────────────────────────────
+  - stage: PR_${{ env }}
+    displayName: "Raise PR — ${{ env }}"
+    dependsOn: Deploy_${{ env }}
+    jobs:
+    - job: raisePR
+      pool:
+        name: Main
+      steps:
+      - script: |
+          echo "Raising PR for ${{ parameters.serviceName }} — ${{ env }}"
+          # gh pr create ... goes here
+        displayName: "Create PR for ${{ env }}"
+
+  # ── Stage 4: Human approval to merge ─────────────────────────
+  - stage: MergeApprove_${{ env }}
+    displayName: "Approve Merge — ${{ env }}"
+    dependsOn: PR_${{ env }}
+    jobs:
+    - job: mergeGate
+      pool: server
+      timeoutInMinutes: 4320
+      steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: 4320
+        inputs:
+          instructions: |
+            Review the PR for ${{ parameters.serviceName }} — ${{ env }}.
+            Click RESUME to merge, REJECT to abort.
+          onTimeout: reject
+
+    - job: merge
+      dependsOn: mergeGate
+      pool:
+        name: Main
+      steps:
+      - script: |
+          echo "Merging PR for ${{ env }}"
+          # gh pr merge ... goes here
+        displayName: "Merge PR for ${{ env }}"
